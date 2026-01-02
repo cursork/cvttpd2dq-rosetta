@@ -3,9 +3,18 @@
 # Interactive walkthrough of the Rosetta 2 cvttpd2dq bug
 #
 # Usage: ./walkthrough /path/to/demo/dir
+#        ./walkthrough --asciinema /path/to/demo/dir   (auto-advance with 5s delays)
 #
 
 set -e
+
+# Check for asciinema mode
+ASCIINEMA_MODE=0
+PAUSE_SECONDS=5
+if [ "$1" = "--asciinema" ] || [ "$1" = "-a" ]; then
+    ASCIINEMA_MODE=1
+    shift
+fi
 
 # Colors
 RED='\033[0;31m'
@@ -17,7 +26,11 @@ NC='\033[0m'
 
 pause() {
     echo
-    read -p "$(echo -e "${YELLOW}Press Enter to continue...${NC}")" _
+    if [ "$ASCIINEMA_MODE" = "1" ]; then
+        sleep "$PAUSE_SECONDS"
+    else
+        read -p "$(echo -e "${YELLOW}Press Enter to continue...${NC}")" _
+    fi
     echo
 }
 
@@ -35,16 +48,23 @@ code() {
 
 run() {
     echo -e "${YELLOW}\$ $1${NC}"
-    read -p "Press Enter to run..." _
+    if [ "$ASCIINEMA_MODE" = "1" ]; then
+        sleep "$PAUSE_SECONDS"
+    else
+        read -p "Press Enter to run..." _
+    fi
     eval "$1"
 }
 
 # Check arguments
 if [ -z "$1" ]; then
-    echo "Usage: $0 /path/to/demo/dir"
+    echo "Usage: $0 [-a|--asciinema] /path/to/demo/dir"
     echo
     echo "This script creates a demo directory and walks through the"
     echo "Rosetta 2 cvttpd2dq bug step by step."
+    echo
+    echo "Options:"
+    echo "  -a, --asciinema    Auto-advance mode with ${PAUSE_SECONDS}s delays (for recording)"
     exit 1
 fi
 
