@@ -17,6 +17,10 @@ TABLE OF CONTENTS
 5. The Trampoline Technique
 6. Putting It All Together
 
+NOTE: This is a simplified, educational version. The production `patch.py`
+also supports a "segment gap" fallback for tightly-packed binaries that
+lack NOP/INT3 code caves (e.g., Dyalog APL).
+
 ================================================================================
 1. BACKGROUND: THE BUG
 ================================================================================

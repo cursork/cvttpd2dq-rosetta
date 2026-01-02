@@ -2,16 +2,27 @@
 """
 Binary patch for Rosetta 2 cvttpd2dq/cvtpd2dq bug.
 
-The bug: Both cvttpd2dq and cvtpd2dq corrupt xmmSRC with the converted value.
+The bug: Both cvttpd2dq and cvtpd2dq corrupt the source XMM register with
+the converted value under Apple's Rosetta 2 emulator.
 
 Fix: Replace each instruction with a jump to a trampoline that saves and
 restores the source register around the instruction.
 
+This unified script handles two strategies for finding space for trampolines:
+  1. Code caves: NOP/INT3 padding regions (works for most binaries)
+  2. Segment gap: Zero-padding between ELF segments (fallback for tightly packed binaries)
+
 Usage: python3 patch.py <input-binary> <output-binary>
+
+Tested on: Node.js 25, Bun, Dyalog APL
 """
 import sys
 import struct
 
+
+# =============================================================================
+# INSTRUCTION FINDING
+# =============================================================================
 
 def find_cvt_instructions(data):
     """
@@ -48,8 +59,8 @@ def find_cvt_instructions(data):
 
 def decode_next_instruction(data, offset):
     """
-    Decode the instruction following cvttpd2dq to determine if it can be
-    safely relocated into the trampoline.
+    Decode the instruction following cvttpd2dq/cvtpd2dq to determine if it can
+    be safely relocated into the trampoline.
 
     Returns (length, can_relocate) tuple.
     """
@@ -98,8 +109,29 @@ def decode_next_instruction(data, offset):
         if offset + 3 >= len(data) or data[offset + 1] != 0x0F:
             return 0, False
         modrm = data[offset + 3]
-        if (modrm >> 6) == 3:  # reg-reg form
-            return 4 + (1 if rex else 0), True
+        mod = (modrm >> 6) & 0x3
+        rm = modrm & 0x7
+        base_len = 4 + (1 if rex else 0)
+
+        if mod == 3:  # reg-reg form
+            return base_len, True
+
+        # Memory operand forms - can relocate unless RIP-relative
+        if mod == 0 and rm == 5:  # RIP-relative - cannot relocate
+            return 0, False
+        if mod == 0 and rm == 4:  # SIB, no displacement
+            return base_len + 1, True
+        if mod == 0:  # [reg], no displacement
+            return base_len, True
+        if mod == 1 and rm == 4:  # SIB + disp8
+            return base_len + 2, True
+        if mod == 1:  # [reg + disp8]
+            return base_len + 1, True
+        if mod == 2 and rm == 4:  # SIB + disp32
+            return base_len + 5, True
+        if mod == 2:  # [reg + disp32]
+            return base_len + 4, True
+
         return 0, False
 
     # MOV reg, reg
@@ -126,6 +158,10 @@ def decode_next_instruction(data, offset):
     return 0, False
 
 
+# =============================================================================
+# CODE CAVE FINDING (Strategy 1: NOP/INT3 padding)
+# =============================================================================
+
 def find_code_caves(data, min_size=64):
     """Find padding areas (NOP/INT3 sequences) that can hold trampolines."""
     caves = []
@@ -142,6 +178,100 @@ def find_code_caves(data, min_size=64):
             i += 1
     return caves
 
+
+# =============================================================================
+# SEGMENT GAP FINDING (Strategy 2: ELF segment gap)
+# =============================================================================
+
+def parse_elf_segments(data):
+    """Parse ELF program headers to find segment boundaries."""
+    if data[:4] != b'\x7fELF':
+        return None  # Not an ELF file
+
+    e_phoff = struct.unpack('<Q', data[32:40])[0]
+    e_phnum = struct.unpack('<H', data[56:58])[0]
+    e_phentsize = struct.unpack('<H', data[54:56])[0]
+
+    segments = []
+    for i in range(e_phnum):
+        off = e_phoff + i * e_phentsize
+        p_type = struct.unpack('<I', data[off:off+4])[0]
+        if p_type == 1:  # PT_LOAD
+            p_flags = struct.unpack('<I', data[off+4:off+8])[0]
+            p_offset = struct.unpack('<Q', data[off+8:off+16])[0]
+            p_filesz = struct.unpack('<Q', data[off+32:off+40])[0]
+            segments.append({
+                'offset': p_offset,
+                'size': p_filesz,
+                'flags': p_flags,
+                'executable': bool(p_flags & 1),
+                'phdr_offset': off
+            })
+    return sorted(segments, key=lambda s: s['offset'])
+
+
+def find_segment_gap_cave(data):
+    """
+    Find usable space in the gap after the executable segment.
+
+    The gap between segments is zero-padded and falls within executable
+    pages at runtime due to page alignment.
+    """
+    segments = parse_elf_segments(data)
+    if not segments:
+        return None
+
+    for i, seg in enumerate(segments):
+        if seg['executable'] and i + 1 < len(segments):
+            seg_end = seg['offset'] + seg['size']
+            next_seg_start = segments[i + 1]['offset']
+            gap = next_seg_start - seg_end
+
+            if gap > 64:  # Need at least 64 bytes
+                # Verify it's zeros
+                if all(b == 0 for b in data[seg_end:next_seg_start]):
+                    return {'offset': seg_end, 'size': gap, 'is_segment_gap': True}
+
+    return None
+
+
+def extend_exec_segment(data, new_end):
+    """
+    Extend the executable segment to include the trampoline area.
+
+    Modifies the p_filesz and p_memsz fields of the executable segment's
+    program header so the trampolines are mapped as executable.
+    """
+    patched = bytearray(data)
+
+    e_phoff = struct.unpack('<Q', data[32:40])[0]
+    e_phnum = struct.unpack('<H', data[56:58])[0]
+    e_phentsize = struct.unpack('<H', data[54:56])[0]
+
+    for i in range(e_phnum):
+        off = e_phoff + i * e_phentsize
+        p_type = struct.unpack('<I', data[off:off+4])[0]
+        if p_type == 1:  # PT_LOAD
+            p_flags = struct.unpack('<I', data[off+4:off+8])[0]
+            if p_flags & 1:  # Executable segment
+                p_offset = struct.unpack('<Q', data[off+8:off+16])[0]
+                old_filesz = struct.unpack('<Q', data[off+32:off+40])[0]
+
+                new_filesz = new_end - p_offset
+                new_memsz = new_filesz
+
+                patched[off+32:off+40] = struct.pack('<Q', new_filesz)
+                patched[off+40:off+48] = struct.pack('<Q', new_memsz)
+
+                print(f"  Extended exec segment: filesz 0x{old_filesz:x} -> 0x{new_filesz:x}")
+                break
+
+    return bytes(patched)
+
+
+# =============================================================================
+# TRAMPOLINE BUILDING
+# =============================================================================
 
 def build_trampoline(src_xmm, dst_xmm, next_bytes, opcode='cvttpd2dq'):
     """
@@ -182,16 +312,25 @@ def build_trampoline(src_xmm, dst_xmm, next_bytes, opcode='cvttpd2dq'):
     return bytes(code)
 
 
+# =============================================================================
+# PATCHING
+# =============================================================================
+
 def patch_binary(data, instances, caves):
     """Apply trampoline patches to the binary."""
     patched = bytearray(data)
     cave_used = {c['offset']: 0 for c in caves}
     count = 0
+    skipped_same_reg = 0
+    skipped_not_relocatable = 0
+    skipped_no_space = 0
 
     for inst in instances:
-        if inst['same_reg']:  # No bug when src == dst
+        if inst['same_reg']:
+            skipped_same_reg += 1
             continue
         if inst['next_len'] < 1 or not inst['next_relocatable']:
+            skipped_not_relocatable += 1
             continue
 
         # Find a cave with space
@@ -201,6 +340,7 @@ def patch_binary(data, instances, caves):
                 cave = c
                 break
         if not cave:
+            skipped_no_space += 1
             continue
 
         offset = inst['offset']
@@ -209,7 +349,7 @@ def patch_binary(data, instances, caves):
 
         # Build and place trampoline
         trampoline = bytearray(build_trampoline(
-            inst['src'], inst['dst'], inst['next_bytes'], inst.get('opcode', 'cvttpd2dq')))
+            inst['src'], inst['dst'], inst['next_bytes'], inst['opcode']))
 
         # Fix up return jump
         jmp_addr = trampoline_addr + len(trampoline)
@@ -226,9 +366,20 @@ def patch_binary(data, instances, caves):
             patched[offset + i] = 0x90
 
         count += 1
-        print(f"  Patched 0x{offset:x}: {inst.get('opcode', 'cvttpd2dq')} xmm{inst['src']} -> xmm{inst['dst']}")
+        print(f"  Patched 0x{offset:x}: {inst['opcode']} xmm{inst['src']} -> xmm{inst['dst']}")
 
-    return bytes(patched), count
+    if skipped_same_reg or skipped_not_relocatable or skipped_no_space:
+        print(f"\nSkipped: {skipped_same_reg} same-reg, {skipped_not_relocatable} non-relocatable, {skipped_no_space} no-space")
+
+    # Calculate total cave usage
+    total_used = sum(cave_used.values())
+    total_available = sum(c['size'] for c in caves)
+    print(f"Cave usage: {total_used}/{total_available} bytes")
+
+    # Return the cave end offset for segment extension if needed
+    max_cave_end = max((c['offset'] + cave_used[c['offset']] for c in caves), default=0)
+
+    return bytes(patched), count, max_cave_end
 
 
 def main():
@@ -239,20 +390,42 @@ def main():
     with open(sys.argv[1], 'rb') as f:
         data = f.read()
 
+    # Find instructions to patch
     instances = find_cvt_instructions(data)
     problematic = [i for i in instances if not i['same_reg']]
-    caves = find_code_caves(data)
 
-    cvttpd2dq_count = len([i for i in instances if i.get('opcode') == 'cvttpd2dq'])
-    cvtpd2dq_count = len([i for i in instances if i.get('opcode') == 'cvtpd2dq'])
+    cvttpd2dq_count = len([i for i in instances if i['opcode'] == 'cvttpd2dq'])
+    cvtpd2dq_count = len([i for i in instances if i['opcode'] == 'cvtpd2dq'])
     print(f"Found {len(instances)} conversion instructions:")
     print(f"  {cvttpd2dq_count} cvttpd2dq (truncate)")
     print(f"  {cvtpd2dq_count} cvtpd2dq (round)")
     print(f"  {len(problematic)} need patching (different src/dst)")
-    print(f"Found {len(caves)} code caves")
 
-    patched, count = patch_binary(data, instances, caves)
+    # Strategy 1: Try code caves first (NOP/INT3 padding)
+    caves = find_code_caves(data)
+    used_segment_gap = False
+
+    if caves:
+        print(f"Found {len(caves)} code caves")
+    else:
+        # Strategy 2: Fall back to segment gap
+        print("No code caves found, trying segment gap...")
+        gap_cave = find_segment_gap_cave(data)
+        if gap_cave:
+            print(f"Using segment gap: 0x{gap_cave['offset']:x} ({gap_cave['size']} bytes)")
+            caves = [gap_cave]
+            used_segment_gap = True
+        else:
+            print("ERROR: No code caves or segment gap found!")
+            sys.exit(1)
+
+    # Apply patches
+    patched, count, cave_end = patch_binary(data, instances, caves)
     print(f"\nPatched {count} instructions")
+
+    # If we used segment gap, extend the executable segment
+    if used_segment_gap and count > 0:
+        patched = extend_exec_segment(patched, cave_end)
 
     with open(sys.argv[2], 'wb') as f:
         f.write(patched)

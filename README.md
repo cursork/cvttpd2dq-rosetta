@@ -105,12 +105,10 @@ docker run --platform linux/amd64 --rm rosetta-bug
 
 ## The Fix
 
-The included patch scripts binary-patch executables to work around the bug:
+`patch.py` binary-patches executables to work around the bug. It automatically handles two strategies:
 
-| Script | Use Case |
-|--------|----------|
-| `patch.py` | General binaries with NOP/INT3 code caves (e.g., Node.js, Bun) |
-| `patch_dyalog.py` | Binaries without code caves, uses segment gap (e.g., Dyalog APL) |
+1. **Code caves** (default): Uses NOP/INT3 padding regions found in most binaries
+2. **Segment gap** (fallback): Uses zero-padding between ELF segments for tightly packed binaries
 
 The patching process:
 1. Finds all `cvttpd2dq` and `cvtpd2dq` instructions where source != destination
@@ -121,12 +119,7 @@ The patching process:
    - Returns to the original code
 
 ```bash
-# Patch Node.js or similar (has NOP padding for trampolines)
 python3 patch.py /path/to/binary /path/to/binary-patched
-
-# Patch Dyalog APL or similar (uses segment gap for trampolines)
-python3 patch_dyalog.py /path/to/binary /path/to/binary-patched
-
 chmod +x /path/to/binary-patched
 ```
 
