@@ -1,0 +1,73 @@
+# Rosetta 2 Floating-Point Bug and LLM-Derived Fix: Deep Dive Analysis
+
+## Overview of the Floating-Point Truncation Issue
+
+**The Symptom:** When running certain x86-64 binaries under Apple's Rosetta 2 (the x86→ARM translation layer on Apple Silicon), floating-point numbers may become *silently truncated* to integers. For example, Node.js code that prints a simple decimal like `0.25` or even `Math.PI` can unexpectedly output `0` or `3` (truncated integers) instead of the correct decimal values. This issue has been observed on M1 Macs when running x86-64 code via Rosetta (e.g. in Docker containers), and does not occur when running the equivalent ARM64 code natively or when Rosetta is disabled.
+
+**Reproduction Example:** Running Node.js v25 (compiled for x86-64) on an M1 Mac to print 0.25 yields 0, whereas on a native ARM64 build the output is 0.25 as expected. Likewise, `1/4` evaluates to 0 instead of 0.25, and `Math.PI` prints as 3 instead of 3.14159... – clearly, fractional parts are being dropped. Community bug reports (e.g. for the Bun runtime) confirm that under Rosetta 2, `0.25` becomes `0` and `1.25` becomes `1` in multiple contexts. The problem is reproducible only under Rosetta’s x86_64 emulation, not on real x86_64 hardware or when using alternative emulation backends.
+
+## Root Cause: A Rosetta 2 Emulation Bug in an SSE2 Instruction
+
+**The Culprit Instruction:** Analysis traced the issue to a specific Intel SSE2 instruction: **CVTTPD2DQ** (Convert with Truncation Packed Double-Precision to Packed Dword). This instruction, when executed on *real* x86-64 hardware, is supposed to convert two double-precision floats in a source XMM register to two 32-bit integers in a destination XMM register, truncating the fractional part. Importantly, the specification says nothing about modifying the source register – the source should remain intact. In other words, `CVTTPD2DQ xmm1, xmm0` should take the two doubles in `xmm0`, convert them to two ints in `xmm1`, and leave the original `xmm0` value unchanged.
+
+**Rosetta’s Behavior:** Under Rosetta 2, however, this instruction is **buggy**. When emulating `cvttpd2dq`, Rosetta erroneously *overwrites the source XMM register* with the truncated value as well. Effectively, after `cvttpd2dq %xmm0, %xmm1`, not only does `xmm1` contain the truncated integer results (as it should), but `xmm0` has been clobbered and now also holds the truncated value, losing its original fractional part. This is a serious bug in the emulator: the real CPU would have left `xmm0` untouched (since the instruction is not supposed to alter the source operand).
+
+**Why This Causes Truncation:** Many high-level operations (like converting a string “0.25” to a Number in JavaScript’s V8 engine, or printing a float) use conversion sequences that involve this instruction. If the code expects the source XMM register to still hold the original float after conversion (e.g. for further computations or checks), Rosetta’s mistake means the code is now working with a truncated value. In V8’s float parsing routine, for instance, the logic likely loads a double into a register, calls a truncating-conversion to int, then later uses the original double for something – but under Rosetta the “original” has been corrupted. This explains why the output loses its fractional part: any operation that relies on that register after the faulty conversion will only see the truncated integer portion.
+
+**Independent Confirmation:** The bug was independently demonstrated with a minimal C test that directly uses inline assembly. The test loads 0.25 into `xmm0`, executes `cvttpd2dq %%xmm0, %%xmm1`, and then checks if `xmm0` changed. On real x86-64 hardware, `xmm0` remains 0.25 and the program prints “OK”. Under Rosetta 2, `xmm0` becomes 0.0, and the program detects that *“BUG: xmm0 was corrupted!”*. In fact, the test prints “Before: 0.25, After: 0” under Rosetta, proving that the source register was zeroed out by the conversion.
+
+## Why Node 24 Worked While Node 25 Broke
+
+Interestingly, earlier Node.js versions (e.g. Node 16 or 18, corresponding to Docker image `node:24` in the example) did **not** exhibit this issue under Rosetta. The root cause is not a change in V8’s logic per se, but a change in how the code was compiled:
+
+- **Node 24 / older builds:** Compiled with GCC, which for the relevant float-to-int conversion used the scalar SSE2 instruction `CVTTSD2SI` (convert scalar double to 32-bit int). This instruction writes the integer result to a general-purpose register (or lower 32 bits of an XMM) and does **not reuse the XMM register for output**, so it doesn’t implicate the Rosetta bug. The source XMM remains intact simply because the conversion target is a different kind of register.
+
+- **Node 25 / newer builds:** Switched to using Clang (LLVM) 15+ for compilation. Clang chose to emit the packed vector instruction `CVTTPD2DQ` to convert doubles to ints in a vector register. This is a legitimate optimization – using a vector instruction to handle two values at once or simply as an available SSE2 instruction. Unfortunately, this *precisely* triggers the Rosetta bug: `CVTTPD2DQ` with distinct source/destination registers.
+
+In short, both compilers were emitting correct x86 code for floating-point conversion, but **Clang’s choice of using the packed conversion exposed a bug in Rosetta that GCC’s choice avoided**. The table below summarizes the difference:
+
+| Node Version | Compiler | Instruction used        | Outcome under Rosetta 2      |
+|--------------|----------|-------------------------|-----------------------------|
+| **Node 24**  | GCC      | `cvttsd2si` (scalar SSE2)| **Works** (no truncation) |
+| **Node 25**  | Clang 19 | `cvttpd2dq` (packed SSE2)| **Fails** (truncation bug) |
+
+This kind of discrepancy isn’t unusual: compilers often have multiple ways to emit a given operation. In this case, Clang opted for a vectorized approach (possibly to handle 64-bit conversion efficiently), whereas GCC stuck to the scalar intrinsic. Normally both are fine – **it’s the Rosetta emulator that is at fault here, not Clang**. But the end result is that newer Node (and other software compiled with recent LLVM) suffer from this Rosetta-specific bug, while older builds did not.
+
+## Crafting a Fix via Binary Patching
+
+Ideally, Apple will need to fix Rosetta 2’s handling of `CVTTPD2DQ` in a macOS update. In the meantime, the repository author (with the help of an LLM assistant) developed a clever *binary patch* as a workaround. Rather than modifying source code (which for something like Node.js or Bun’s V8 would be non-trivial for an end-user), the patch targets the compiled binary at the machine-code level:
+
+1. **Scan for the problem instruction:** The patch script (`patch.py`) searches the binary for occurrences of the `CVTTPD2DQ` opcode where the source and destination registers are different. These are the instances that would corrupt a live source register under Rosetta. (If the opcode uses the same register for src and dest, it wouldn’t matter if Rosetta clobbers it, since the value is supposed to be overwritten anyway. So those can be left alone.)
+
+2. **Inject a trampoline for each occurrence:** For each vulnerable instruction, the binary is modified to *jump to a custom trampoline* code sequence (appended somewhere in unused space or at the end of the binary). This trampoline performs the conversion safely:
+   - It **saves the original source XMM register** (for example, by pushing it onto the stack or moving it to a temporary area).
+   - It executes the `CVTTPD2DQ` instruction on the now-saved source value. Even if Rosetta corrupts the “source” register, we’re operating on a saved copy, or we will restore it next.
+   - It **restores the original XMM register’s value** from where it was saved.
+   - It then jumps back to the location right after the original instruction, so execution continues as normal.
+
+   Essentially, this patch makes the conversion *explicitly preserve* the would-be clobbered register. So even if Rosetta mishandles the internals, the program’s architectural state is corrected. The destination register still receives the truncated integer (so program logic that needed that result will get it), but the source register is put back to what it was.
+
+3. **Overwrite the original instruction with a jump:** The bytes of the original `cvttpd2dq` instruction are replaced by an assembly jump (or call) to the injected trampoline code. This ensures that whenever the program’s flow reaches what used to be the problematic instruction, it is diverted to our safe conversion routine instead.
+
+4. **Adjust any relative addresses if needed:** Since we’re inserting new code, the patch must handle addressing carefully (e.g., using an *inline short jump* if within range, or an absolute jump if not). The provided patch script automates this, ensuring the trampoline is correctly linked.
+
+This binary-patching approach is reminiscent of hotpatching or hooking techniques and requires detailed knowledge of x86 machine code. The LLM-assisted solution effectively generated this patch logic, scanning opcodes and splicing in new bytes.
+
+**Note:** There is a performance cost – each patched occurrence adds the overhead of a jump and save/restore around the conversion. However, these conversions are typically not super-hot code paths (e.g., float parsing during startup or I/O), and the correctness gain is well worth the minor slowdown. It’s a targeted fix: only binaries that actually use `CVTTPD2DQ` will be modified, and only the necessary instructions get patched.
+
+## Verifying the Patch’s Effectiveness
+
+Testing confirms that the patched binaries behave correctly under Rosetta 2. Using the earlier examples:
+
+- The minimal C repro now prints “Before: 0.25, After: 0.25, OK” even under Rosetta, meaning the source register (`xmm0`) remains intact as it should.
+- For Node.js 25, running the same float outputs after patching yields proper results: `0.25` stays `0.25`, `1.5` stays `1.5`, etc., instead of truncating to `0` and `1`. In side-by-side tests, the unpatched Node 25 printed `0.25 = 0 | 1.5 = 1` (indicating wrong behavior), whereas the patched Node 25 printed `0.25 = 0.25 | 1.5 = 1.5` – correctly preserving fractional values.
+
+These outcomes match the expected behavior on real hardware, demonstrating that the patch successfully neutralizes the Rosetta bug. Essentially, the patched binary is now doing what Rosetta *should* have done in the first place (i.e. not clobbering registers during that instruction).
+
+It’s important to highlight that this fix is a **workaround** at the binary level; it doesn’t (and cannot) alter Rosetta itself. But it provides immediate relief for affected software. The issue was also reported upstream (for example, tagged as an Apple Rosetta bug in the Bun issue tracker), so one hopes Apple will address it in a future Rosetta 2 update. Until then, this patch shows that an LLM was able to pinpoint the obscure CPU instruction at fault and implement a robust fix, which is a strong testament to AI-assisted debugging.
+
+## Conclusion
+
+Through detailed analysis, we’ve identified an obscure but critical bug in Apple’s Rosetta 2 translator involving the SSE2 `CVTTPD2DQ` instruction. The bug causes loss of floating-point precision by erroneously overwriting source registers, and it manifested in higher-level applications (Node.js, Bun) as inexplicable truncation of decimals. By comparing compiler behaviors and using a minimal assembler test, the exact root cause was nailed down: Clang-generated vector conversions trigger the Rosetta bug, whereas alternative instructions do not.
+
+The proposed solution – *binary patching the affected instructions* – effectively sidesteps the emulator flaw by preserving the source register around the conversion. Testing confirms that this yields correct results where previously there were errors. This solution was developed with the assistance of a Large Language Model (Claude), showcasing how AI-based coding assistants can not only find bugs but also generate non-trivial fixes (like on-the-fly binary trampolines) that hold up under scrutiny.
