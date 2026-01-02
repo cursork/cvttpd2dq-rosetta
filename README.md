@@ -14,6 +14,8 @@ Run the walkthrough. Bish bash bosh.
 ./walkthrough
 ```
 
+Or read `patch_explained.py` (I haven't fully verified it). You do you.
+
 ## The Problem
 
 ```bash
