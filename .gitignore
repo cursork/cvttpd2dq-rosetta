@@ -1,11 +1,11 @@
 .DS_Store
 FACIENDA.md
 
-# Dyalog (proprietary - do not commit)
-dyalog/
+# Test binaries (extracted from Docker or provided by user)
+binaries/
 *.deb
 
-# Bun binaries (large, can be extracted from Docker)
+# Legacy directories (replaced by binaries/)
+dyalog/
 bun/
 
-binaries/
