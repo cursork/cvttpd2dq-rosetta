@@ -109,7 +109,7 @@ The included patch scripts binary-patch executables to work around the bug:
 
 | Script | Use Case |
 |--------|----------|
-| `patch.py` | General binaries with NOP/INT3 code caves (e.g., Node.js) |
+| `patch.py` | General binaries with NOP/INT3 code caves (e.g., Node.js, Bun) |
 | `patch_dyalog.py` | Binaries without code caves, uses segment gap (e.g., Dyalog APL) |
 
 The patching process:

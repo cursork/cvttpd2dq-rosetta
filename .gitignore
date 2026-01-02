@@ -5,3 +5,7 @@ FACIENDA.md
 dyalog/
 *.deb
 
+# Bun binaries (large, can be extracted from Docker)
+bun/
+
+binaries/
