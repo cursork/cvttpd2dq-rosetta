@@ -8,15 +8,22 @@ versions.
 
 ## TL;DR
 
-Run the walkthrough. Bish bash bosh.
+Run the test suite to see the bug and fix in action:
 
 ```bash
-./walkthrough
+./test-all.sh --extract    # Extracts Node.js + Bun from Docker, tests both
+```
+
+Or if you have a Dyalog APL .deb file:
+
+```bash
+cp /path/to/dyalog*.deb .
+./test-all.sh --extract    # Tests all three: Node.js, Bun, Dyalog APL
 ```
 
 ![Walkthrough demo](walkthrough.gif)
 
-Or read `patch_explained.py` (I haven't fully verified it). You do you.
+For the literate/educational version, read `patch_explained.py`.
 
 ## The Problem
 
@@ -98,7 +105,10 @@ int main(void) {
 ## Quick Test
 
 ```bash
-# Build and run the test
+# Full test suite (recommended)
+./test-all.sh --extract
+
+# Or manual Docker test
 docker build -t rosetta-bug .
 docker run --platform linux/amd64 --rm rosetta-bug
 ```
