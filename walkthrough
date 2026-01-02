@@ -1,0 +1,224 @@
+#!/bin/bash
+#
+# Interactive walkthrough of the Rosetta 2 cvttpd2dq bug
+#
+# Usage: ./walkthrough /path/to/demo/dir
+#
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+pause() {
+    echo
+    read -p "$(echo -e "${YELLOW}Press Enter to continue...${NC}")" _
+    echo
+}
+
+header() {
+    echo
+    echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${BLUE}  $1${NC}"
+    echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════════════${NC}"
+    echo
+}
+
+code() {
+    echo -e "${GREEN}$1${NC}"
+}
+
+run() {
+    echo -e "${YELLOW}\$ $1${NC}"
+    read -p "Press Enter to run..." _
+    eval "$1"
+}
+
+# Check arguments
+if [ -z "$1" ]; then
+    echo "Usage: $0 /path/to/demo/dir"
+    echo
+    echo "This script creates a demo directory and walks through the"
+    echo "Rosetta 2 cvttpd2dq bug step by step."
+    exit 1
+fi
+
+DEMO_DIR="$1"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+header "Rosetta 2 Float Bug - Interactive Walkthrough"
+
+echo "This walkthrough demonstrates a bug in Apple's Rosetta 2 x86-64 emulator"
+echo "that causes floating-point values to be silently truncated to integers."
+echo
+echo -e "We'll set up the demo in: ${BOLD}$DEMO_DIR${NC}"
+
+pause
+
+# Step 1: Show the problem
+header "Step 1: The Problem"
+
+echo "Let's see the bug in action with Node.js 25 running under Rosetta 2."
+echo
+echo "We'll run a simple JavaScript expression that should print 0.25:"
+echo
+
+run "docker run --platform linux/amd64 --rm node:25-slim node -e \"console.log(0.25)\""
+
+echo
+echo -e "${RED}${BOLD}BUG: It printed 0 instead of 0.25!${NC}"
+echo
+echo "This affects all floating-point operations:"
+echo
+
+run "docker run --platform linux/amd64 --rm node:25-slim node -e \"console.log('1/4 =', 1/4, '| Math.PI =', Math.PI)\""
+
+echo
+echo -e "${RED}Fractions become 0, pi becomes 3.${NC}"
+
+pause
+
+# Step 2: Why Node 24 works
+header "Step 2: Why Node 24 Works"
+
+echo "Interestingly, Node.js 24 works fine:"
+echo
+
+run "docker run --platform linux/amd64 --rm node:24-slim node -e \"console.log('1/4 =', 1/4, '| Math.PI =', Math.PI)\""
+
+echo
+echo "The difference? Node 24 was compiled with GCC, Node 25 with Clang."
+echo
+echo "GCC and Clang generate different x86-64 instructions for the same C code:"
+echo
+echo -e "  ${BOLD}GCC:${NC}   cvttsd2si (scalar convert) - works fine"
+echo -e "  ${BOLD}Clang:${NC} cvttpd2dq (packed convert) - ${RED}triggers the bug${NC}"
+
+pause
+
+# Step 3: Set up demo directory
+header "Step 3: Setting Up Demo"
+
+echo "Creating demo directory with minimal reproducer files..."
+echo
+
+run "mkdir -p $DEMO_DIR"
+run "cp $SCRIPT_DIR/test.c $DEMO_DIR/"
+run "cp $SCRIPT_DIR/patch.py $DEMO_DIR/"
+run "cp $SCRIPT_DIR/Dockerfile $DEMO_DIR/"
+
+echo
+echo "Created:"
+run "ls -la $DEMO_DIR"
+
+pause
+
+# Step 4: The root cause
+header "Step 4: Root Cause - The cvttpd2dq Bug"
+
+echo "The bug is in this x86-64 instruction:"
+echo
+code "    cvttpd2dq %xmm0, %xmm1"
+echo
+echo "This converts doubles in xmm0 to integers in xmm1."
+echo
+echo -e "  ${BOLD}Expected:${NC} xmm0 unchanged, xmm1 = truncated integers"
+echo -e "  ${BOLD}Rosetta:${NC}  xmm0 ${RED}ALSO${NC} gets overwritten with truncated value"
+echo
+echo "Let's look at our minimal C reproducer:"
+echo
+
+run "cat $DEMO_DIR/test.c"
+
+pause
+
+# Step 5: Build and test
+header "Step 5: Build the Docker Image"
+
+echo "Building a Docker image that includes:"
+echo "  - The C reproducer"
+echo "  - Node.js 25 (unpatched)"
+echo "  - Node.js 25 (patched with our fix)"
+echo
+echo -e "${YELLOW}This may take a minute...${NC}"
+echo
+
+run "docker build --platform linux/amd64 -t rosetta-bug-demo $DEMO_DIR 2>&1 | tail -10"
+
+pause
+
+# Step 6: Run the demo
+header "Step 6: Demonstrate Bug and Fix"
+
+echo "Now let's run all three tests:"
+echo
+echo "  1. C reproducer - directly tests the cvttpd2dq instruction"
+echo "  2. Unpatched Node 25 - shows the bug in real software"
+echo "  3. Patched Node 25 - shows our fix works"
+echo
+
+run "docker run --platform linux/amd64 --rm rosetta-bug-demo"
+
+pause
+
+# Step 7: How the patch works
+header "Step 7: How the Patch Works"
+
+echo "The patch.py script finds every cvttpd2dq instruction and replaces it"
+echo "with a jump to a 'trampoline' that:"
+echo
+echo "  1. Saves the source register to the stack"
+echo "  2. Executes the original cvttpd2dq"
+echo "  3. Restores the source register from the stack"
+echo "  4. Jumps back"
+echo
+echo "In assembly, each patch looks like:"
+echo
+code "  Original:    cvttpd2dq %xmm0, %xmm1"
+code "  Patched:     jmp trampoline"
+code ""
+code "  Trampoline:  sub rsp, 16"
+code "              movdqu [rsp], xmm0      ; save source"
+code "              cvttpd2dq xmm0, xmm1   ; do convert (corrupts xmm0)"
+code "              movdqu xmm0, [rsp]      ; restore source"
+code "              add rsp, 16"
+code "              jmp back"
+
+pause
+
+# Step 8: Interactive testing
+header "Step 8: Try It Yourself"
+
+echo "You can now interactively compare patched vs unpatched:"
+echo
+echo -e "  ${BOLD}Unpatched (buggy):${NC}"
+code "  docker run --platform linux/amd64 --rm -it rosetta-bug-demo /opt/node25/bin/node"
+echo
+echo -e "  ${BOLD}Patched (fixed):${NC}"
+code "  docker run --platform linux/amd64 --rm -it rosetta-bug-demo /opt/node25/bin/node-patched"
+echo
+echo "Or patch any other affected binary:"
+echo
+code "  python3 $DEMO_DIR/patch.py /path/to/binary /path/to/binary-patched"
+
+pause
+
+# Summary
+header "Summary"
+
+echo "You've seen:"
+echo
+echo "  ✗ Node.js 25 prints 0.25 as 0 under Rosetta 2"
+echo "  ✓ Node.js 24 (GCC-compiled) works correctly"
+echo "  ✓ The bug is in Rosetta's cvttpd2dq implementation"
+echo "  ✓ Our binary patch fixes affected executables"
+echo
+echo -e "Demo files are in: ${BOLD}$DEMO_DIR${NC}"
+echo
+echo "Related: https://github.com/oven-sh/bun/issues/19677"
+echo
