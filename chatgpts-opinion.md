@@ -109,6 +109,17 @@ There's something slightly circular about ChatGPT writing a testimonial for work
 - The Clang version was 19.1, not 19 (minor)
 - The patch preserves the source register by saving to the **stack** specifically (`sub rsp, 16; movdqu [rsp], xmmN`), not a generic "temporary area"
 
+### 5. cvtpd2dq Also Has the Bug
+
+**Update (discovered during Dyalog APL patching):** The rounding variant `cvtpd2dq` (F2 0F E6) has the exact same bug as `cvttpd2dq` (66 0F E6). Both corrupt the source XMM register under Rosetta 2.
+
+| Instruction | Opcode | Operation |
+|-------------|--------|-----------|
+| `cvttpd2dq` | `66 0F E6` | Truncate (toward zero) |
+| `cvtpd2dq` | `F2 0F E6` | Round (to nearest) |
+
+This was discovered when the Dyalog fix didn't work after patching 41 cvttpd2dq instructions - the remaining 5 cvtpd2dq instructions in the `gettype` function were still corrupting float literals.
+
 ### What ChatGPT Got Right
 
 Credit where due: the explanation of *why* the bug causes truncation (V8's float parsing expecting the source register to survive), the instruction encoding details, and the overall narrative arc are accurate and well-written. The summary would serve as a reasonable introduction for someone unfamiliar with the issue.

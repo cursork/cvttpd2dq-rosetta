@@ -8,15 +8,22 @@ versions.
 
 ## TL;DR
 
-Run the walkthrough. Bish bash bosh.
+Run the test suite to see the bug and fix in action:
 
 ```bash
-./walkthrough
+./test-all.sh --extract    # Extracts Node.js + Bun from Docker, tests both
+```
+
+Or if you have a Dyalog APL .deb file:
+
+```bash
+cp /path/to/dyalog*.deb .
+./test-all.sh --extract    # Tests all three: Node.js, Bun, Dyalog APL
 ```
 
 ![Walkthrough demo](walkthrough.gif)
 
-Or read `patch_explained.py` (I haven't fully verified it). You do you.
+For the literate/educational version, read `patch_explained.py`.
 
 ## The Problem
 
@@ -35,16 +42,22 @@ Floating-point numbers are silently truncated to integers.
 
 ## Root Cause
 
-The x86-64 instruction `cvttpd2dq` (Convert Truncated Packed Double to Packed Dword) has a bug in Rosetta 2:
+Two x86-64 packed double-to-integer conversion instructions have bugs in Rosetta 2:
+
+| Instruction | Opcode | Operation |
+|-------------|--------|-----------|
+| `cvttpd2dq` | `66 0F E6` | Truncate (toward zero) |
+| `cvtpd2dq` | `F2 0F E6` | Round (to nearest) |
 
 ```asm
 cvttpd2dq %xmm0, %xmm1    ; Convert doubles in xmm0 to ints in xmm1
+cvtpd2dq  %xmm0, %xmm1    ; Same, but rounds instead of truncates
 ```
 
-**Expected:** xmm0 unchanged, xmm1 contains truncated integers
-**Rosetta 2:** xmm0 **also** gets overwritten with the truncated value
+**Expected:** xmm0 unchanged, xmm1 contains converted integers
+**Rosetta 2:** xmm0 **also** gets overwritten with the converted value
 
-This breaks any code that uses the source register after the conversion - which is exactly what happens in V8's float parsing.
+This breaks any code that uses the source register after the conversion - which is exactly what happens in V8's float parsing and Dyalog APL's number literal parsing.
 
 ## Why Node 24 Works
 
@@ -92,24 +105,30 @@ int main(void) {
 ## Quick Test
 
 ```bash
-# Build and run the test
+# Full test suite (recommended)
+./test-all.sh --extract
+
+# Or manual Docker test
 docker build -t rosetta-bug .
 docker run --platform linux/amd64 --rm rosetta-bug
 ```
 
 ## The Fix
 
-The included `patch.py` script binary-patches executables to work around the bug:
+`patch.py` binary-patches executables to work around the bug. It automatically handles two strategies:
 
-1. Finds all `cvttpd2dq` instructions where source != destination
+1. **Code caves** (default): Uses NOP/INT3 padding regions found in most binaries
+2. **Segment gap** (fallback): Uses zero-padding between ELF segments for tightly packed binaries
+
+The patching process:
+1. Finds all `cvttpd2dq` and `cvtpd2dq` instructions where source != destination
 2. Replaces each with a jump to a trampoline that:
    - Saves the source register
-   - Executes `cvttpd2dq`
+   - Executes the conversion instruction
    - Restores the source register
    - Returns to the original code
 
 ```bash
-# Patch any affected binary
 python3 patch.py /path/to/binary /path/to/binary-patched
 chmod +x /path/to/binary-patched
 ```

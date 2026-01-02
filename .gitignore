@@ -1,3 +1,11 @@
 .DS_Store
 FACIENDA.md
 
+# Test binaries (extracted from Docker or provided by user)
+binaries/
+*.deb
+
+# Legacy directories (replaced by binaries/)
+dyalog/
+bun/
+
