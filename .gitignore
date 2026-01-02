@@ -1,3 +1,7 @@
 .DS_Store
 FACIENDA.md
 
+# Dyalog (proprietary - do not commit)
+dyalog/
+*.deb
+

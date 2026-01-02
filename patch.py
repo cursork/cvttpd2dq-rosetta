@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Binary patch for Rosetta 2 cvttpd2dq bug.
+Binary patch for Rosetta 2 cvttpd2dq/cvtpd2dq bug.
 
-The bug: cvttpd2dq %xmmSRC, %xmmDST corrupts xmmSRC with the truncated value.
+The bug: Both cvttpd2dq and cvtpd2dq corrupt xmmSRC with the converted value.
 
-Fix: Replace each cvttpd2dq with a jump to a trampoline that saves and
+Fix: Replace each instruction with a jump to a trampoline that saves and
 restores the source register around the instruction.
 
 Usage: python3 patch.py <input-binary> <output-binary>
@@ -13,22 +13,24 @@ import sys
 import struct
 
 
-def find_cvttpd2dq(data):
+def find_cvt_instructions(data):
     """
-    Find all cvttpd2dq instructions with register-register encoding.
+    Find all cvttpd2dq and cvtpd2dq instructions with register-register encoding.
 
-    Encoding: 66 0F E6 ModRM
+    cvttpd2dq (truncate): 66 0F E6 ModRM
+    cvtpd2dq (round):     F2 0F E6 ModRM
     ModRM for reg-reg: 11 DDD SSS (mod=3, dst=DDD, src=SSS)
     """
     results = []
     i = 0
     while i < len(data) - 3:
-        if data[i:i+3] == b'\x66\x0f\xe6':
+        if data[i:i+3] == b'\x66\x0f\xe6' or data[i:i+3] == b'\xf2\x0f\xe6':
             modrm = data[i+3]
             mod = (modrm >> 6) & 0x3
             dst = (modrm >> 3) & 0x7
             src = modrm & 0x7
             if mod == 3:  # register-register form
+                opcode = 'cvttpd2dq' if data[i] == 0x66 else 'cvtpd2dq'
                 next_len, relocatable = decode_next_instruction(data, i + 4)
                 results.append({
                     'offset': i,
@@ -37,7 +39,8 @@ def find_cvttpd2dq(data):
                     'same_reg': src == dst,
                     'next_len': next_len,
                     'next_relocatable': relocatable,
-                    'next_bytes': data[i+4:i+4+next_len] if next_len > 0 else b''
+                    'next_bytes': data[i+4:i+4+next_len] if next_len > 0 else b'',
+                    'opcode': opcode
                 })
         i += 1
     return results
@@ -140,11 +143,11 @@ def find_code_caves(data, min_size=64):
     return caves
 
 
-def build_trampoline(src_xmm, dst_xmm, next_bytes):
+def build_trampoline(src_xmm, dst_xmm, next_bytes, opcode='cvttpd2dq'):
     """
     Build trampoline that:
     1. Saves source XMM register
-    2. Executes cvttpd2dq (which will corrupt source - but we saved it)
+    2. Executes cvttpd2dq/cvtpd2dq (which will corrupt source - but we saved it)
     3. Restores source XMM register
     4. Executes the relocated next instruction
     5. Jumps back
@@ -158,9 +161,10 @@ def build_trampoline(src_xmm, dst_xmm, next_bytes):
     code += b'\xf3\x0f\x7f'
     code += bytes([0x04 | (src_xmm << 3), 0x24])
 
-    # cvttpd2dq xmmSRC, xmmDST (the buggy instruction)
+    # cvttpd2dq or cvtpd2dq xmmSRC, xmmDST (the buggy instruction)
     modrm = 0xC0 | (dst_xmm << 3) | src_xmm
-    code += bytes([0x66, 0x0f, 0xe6, modrm])
+    prefix = 0x66 if opcode == 'cvttpd2dq' else 0xF2
+    code += bytes([prefix, 0x0f, 0xe6, modrm])
 
     # movdqu xmmN, [rsp] (restore source)
     code += b'\xf3\x0f\x6f'
@@ -205,7 +209,7 @@ def patch_binary(data, instances, caves):
 
         # Build and place trampoline
         trampoline = bytearray(build_trampoline(
-            inst['src'], inst['dst'], inst['next_bytes']))
+            inst['src'], inst['dst'], inst['next_bytes'], inst.get('opcode', 'cvttpd2dq')))
 
         # Fix up return jump
         jmp_addr = trampoline_addr + len(trampoline)
@@ -222,7 +226,7 @@ def patch_binary(data, instances, caves):
             patched[offset + i] = 0x90
 
         count += 1
-        print(f"  Patched 0x{offset:x}: xmm{inst['src']} -> xmm{inst['dst']}")
+        print(f"  Patched 0x{offset:x}: {inst.get('opcode', 'cvttpd2dq')} xmm{inst['src']} -> xmm{inst['dst']}")
 
     return bytes(patched), count
 
@@ -235,11 +239,15 @@ def main():
     with open(sys.argv[1], 'rb') as f:
         data = f.read()
 
-    instances = find_cvttpd2dq(data)
+    instances = find_cvt_instructions(data)
     problematic = [i for i in instances if not i['same_reg']]
     caves = find_code_caves(data)
 
-    print(f"Found {len(instances)} cvttpd2dq instructions")
+    cvttpd2dq_count = len([i for i in instances if i.get('opcode') == 'cvttpd2dq'])
+    cvtpd2dq_count = len([i for i in instances if i.get('opcode') == 'cvtpd2dq'])
+    print(f"Found {len(instances)} conversion instructions:")
+    print(f"  {cvttpd2dq_count} cvttpd2dq (truncate)")
+    print(f"  {cvtpd2dq_count} cvtpd2dq (round)")
     print(f"  {len(problematic)} need patching (different src/dst)")
     print(f"Found {len(caves)} code caves")
 

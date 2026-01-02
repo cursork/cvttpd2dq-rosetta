@@ -35,16 +35,22 @@ Floating-point numbers are silently truncated to integers.
 
 ## Root Cause
 
-The x86-64 instruction `cvttpd2dq` (Convert Truncated Packed Double to Packed Dword) has a bug in Rosetta 2:
+Two x86-64 packed double-to-integer conversion instructions have bugs in Rosetta 2:
+
+| Instruction | Opcode | Operation |
+|-------------|--------|-----------|
+| `cvttpd2dq` | `66 0F E6` | Truncate (toward zero) |
+| `cvtpd2dq` | `F2 0F E6` | Round (to nearest) |
 
 ```asm
 cvttpd2dq %xmm0, %xmm1    ; Convert doubles in xmm0 to ints in xmm1
+cvtpd2dq  %xmm0, %xmm1    ; Same, but rounds instead of truncates
 ```
 
-**Expected:** xmm0 unchanged, xmm1 contains truncated integers
-**Rosetta 2:** xmm0 **also** gets overwritten with the truncated value
+**Expected:** xmm0 unchanged, xmm1 contains converted integers
+**Rosetta 2:** xmm0 **also** gets overwritten with the converted value
 
-This breaks any code that uses the source register after the conversion - which is exactly what happens in V8's float parsing.
+This breaks any code that uses the source register after the conversion - which is exactly what happens in V8's float parsing and Dyalog APL's number literal parsing.
 
 ## Why Node 24 Works
 
@@ -99,18 +105,28 @@ docker run --platform linux/amd64 --rm rosetta-bug
 
 ## The Fix
 
-The included `patch.py` script binary-patches executables to work around the bug:
+The included patch scripts binary-patch executables to work around the bug:
 
-1. Finds all `cvttpd2dq` instructions where source != destination
+| Script | Use Case |
+|--------|----------|
+| `patch.py` | General binaries with NOP/INT3 code caves (e.g., Node.js) |
+| `patch_dyalog.py` | Binaries without code caves, uses segment gap (e.g., Dyalog APL) |
+
+The patching process:
+1. Finds all `cvttpd2dq` and `cvtpd2dq` instructions where source != destination
 2. Replaces each with a jump to a trampoline that:
    - Saves the source register
-   - Executes `cvttpd2dq`
+   - Executes the conversion instruction
    - Restores the source register
    - Returns to the original code
 
 ```bash
-# Patch any affected binary
+# Patch Node.js or similar (has NOP padding for trampolines)
 python3 patch.py /path/to/binary /path/to/binary-patched
+
+# Patch Dyalog APL or similar (uses segment gap for trampolines)
+python3 patch_dyalog.py /path/to/binary /path/to/binary-patched
+
 chmod +x /path/to/binary-patched
 ```
 
