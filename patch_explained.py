@@ -346,8 +346,9 @@ def build_trampoline(src_xmm: int, dst_xmm: int, next_bytes: bytes) -> bytes:
         from the following instruction by relocating it into the trampoline.
 
     References:
-        - "Binary Rewriting without Relocation Information" by M. Prasad & T. Chiueh
-          https://www.usenix.org/legacy/events/usenix05/tech/general/prasad.html
+        - "Static Binary Rewriting without Supplemental Information"
+          Smithson et al., IEEE WCRE 2013
+          https://terpconnect.umd.edu/~barua/smithson-WCRE-2013.pdf
 
         - Frida dynamic instrumentation: https://frida.re/
     """
