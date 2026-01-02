@@ -35,11 +35,10 @@ Under Rosetta 2, xmm0 is incorrectly overwritten with the truncated values.
 
 References:
     - Intel® 64 and IA-32 Architectures Software Developer's Manual, Vol. 2A
-      Section 3.2 "CVTTPD2DQ—Convert with Truncation Packed Double-Precision
-      Floating-Point Values to Packed Doubleword Integers"
+      Instruction Set Reference (A-L), see CVTTPD2DQ entry
       https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
 
-    - Original bug report (Bun):
+    - Bun issue discussing this bug under Rosetta:
       https://github.com/oven-sh/bun/issues/19677
 
 ================================================================================
@@ -79,7 +78,8 @@ References:
     - Intel® 64 and IA-32 Architectures Software Developer's Manual, Vol. 2A
       Chapter 2 "Instruction Format"
 
-    - "x86 Instruction Encoding Revealed" by A. Fog
+    - Agner Fog's optimization manuals, particularly "Optimizing subroutines
+      in assembly language" which covers x86 instruction encoding
       https://www.agner.org/optimize/
 
 ================================================================================
