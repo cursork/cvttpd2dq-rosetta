@@ -93,13 +93,20 @@ extract_binaries() {
         oven/bun:latest cp /usr/local/bin/bun /out/bun 2>/dev/null
     print_pass "Bun extracted to $BINARIES_DIR/bun"
 
-    echo ""
-    print_info "Note: Dyalog APL must be obtained separately (proprietary)"
-    print_info "Place dyalog-unicode_*.deb in current directory and run:"
-    print_info "  mkdir -p $BINARIES_DIR/dyalog-extract"
-    print_info "  bsdtar -xf dyalog-unicode_*.deb -C $BINARIES_DIR/dyalog-extract"
-    print_info "  bsdtar -xf $BINARIES_DIR/dyalog-extract/data.tar.* -C $BINARIES_DIR/dyalog-extract"
-    print_info "  cp $BINARIES_DIR/dyalog-extract/opt/mdyalog/*/64/unicode/dyalog $BINARIES_DIR/dyalog"
+    # Check for Dyalog .deb in current directory
+    DEB_FILE=$(ls dyalog*.deb 2>/dev/null | head -1)
+    if [ -n "$DEB_FILE" ]; then
+        print_test "Extracting Dyalog APL from $DEB_FILE..."
+        mkdir -p "$BINARIES_DIR/dyalog-extract"
+        bsdtar -xf "$DEB_FILE" -C "$BINARIES_DIR/dyalog-extract"
+        bsdtar -xf "$BINARIES_DIR/dyalog-extract/data.tar."* -C "$BINARIES_DIR/dyalog-extract"
+        cp "$BINARIES_DIR/dyalog-extract/opt/mdyalog/"*/64/unicode/dyalog "$BINARIES_DIR/dyalog"
+        print_pass "Dyalog extracted to $BINARIES_DIR/dyalog"
+    else
+        echo ""
+        print_info "Note: Dyalog APL not found (no dyalog*.deb in current directory)"
+        print_info "To test Dyalog, place the .deb file here and re-run --extract"
+    fi
 }
 
 run_in_docker() {
@@ -146,11 +153,13 @@ test_dyalog() {
     local binary="$1"
     local label="$2"
 
-    # Dyalog needs its libraries
+    # Dyalog needs DYALOG env var pointing to its install directory
+    local DYALOG_DIR="/opt/mdyalog/20.0/64/unicode"
     result=$(docker run --platform linux/amd64 --rm \
         -v "$(pwd)/$BINARIES_DIR:/binaries:ro" \
         -v "$(pwd)/$BINARIES_DIR/dyalog-extract/opt/mdyalog:/opt/mdyalog:ro" \
-        -e "LD_LIBRARY_PATH=/opt/mdyalog/20.0/64/unicode/lib" \
+        -e "DYALOG=$DYALOG_DIR" \
+        -e "LD_LIBRARY_PATH=$DYALOG_DIR/lib" \
         debian:bookworm-slim \
         sh -c "echo '1.5+2.5' | /binaries/$binary -s 2>/dev/null | head -1" 2>/dev/null || echo "ERROR")
 
