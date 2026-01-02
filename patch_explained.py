@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-LITERATE BINARY PATCH FOR ROSETTA 2 cvttpd2dq BUG
+LITERATE BINARY PATCH FOR ROSETTA 2 cvttpd2dq/cvtpd2dq BUG
 ================================================================================
 
 This script patches x86-64 binaries to work around a bug in Apple's Rosetta 2
-emulator where the `cvttpd2dq` instruction incorrectly corrupts its source
-register.
+emulator where `cvttpd2dq` and `cvtpd2dq` instructions incorrectly corrupt
+their source registers.
 
 TABLE OF CONTENTS
 -----------------
 1. Background: The Bug
 2. x86-64 Instruction Encoding Primer
-3. Finding cvttpd2dq Instructions
+3. Finding Buggy Instructions
 4. Code Caves: Finding Space for Patches
 5. The Trampoline Technique
 6. Putting It All Together
@@ -21,21 +21,29 @@ TABLE OF CONTENTS
 1. BACKGROUND: THE BUG
 ================================================================================
 
-The `cvttpd2dq` instruction converts packed double-precision floats to packed
-32-bit integers with truncation:
+Two x86-64 packed double-to-integer conversion instructions have bugs in
+Rosetta 2:
 
-    cvttpd2dq %xmm0, %xmm1
+    | Instruction   | Opcode    | Operation                    |
+    |---------------|-----------|------------------------------|
+    | cvttpd2dq     | 66 0F E6  | Truncate (toward zero)       |
+    | cvtpd2dq      | F2 0F E6  | Round (to nearest)           |
 
-This should:
-    - READ two doubles from xmm0
-    - WRITE two truncated integers to the low 64 bits of xmm1
-    - Leave xmm0 UNCHANGED
+Both should:
+    - READ two doubles from the source XMM register
+    - WRITE two 32-bit integers to the destination XMM register
+    - Leave the source UNCHANGED
 
-Under Rosetta 2, xmm0 is incorrectly overwritten with the truncated values.
+Under Rosetta 2, the source register is incorrectly overwritten with the
+converted values.
+
+Example:
+    cvttpd2dq %xmm0, %xmm1   ; xmm0 should remain 0.25
+                              ; Rosetta corrupts xmm0 to 0
 
 References:
     - Intel® 64 and IA-32 Architectures Software Developer's Manual, Vol. 2A
-      Instruction Set Reference (A-L), see CVTTPD2DQ entry
+      Instruction Set Reference, see CVTTPD2DQ and CVTPD2DQ entries
       https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
 
     - Bun issue discussing this bug under Rosetta:
@@ -49,13 +57,14 @@ x86-64 instructions are variable-length, consisting of:
 
     [Prefixes] [Opcode] [ModR/M] [SIB] [Displacement] [Immediate]
 
-For cvttpd2dq with register operands:
+Both buggy instructions share the same structure with different prefixes:
 
-    66 0F E6 ModRM
-    │  │  │  └── ModR/M byte specifying registers
-    │  │  └── Opcode byte 3
-    │  └── Two-byte opcode escape
-    └── Mandatory prefix (operand size override, required for this instruction)
+    cvttpd2dq:  66 0F E6 ModRM   (66 = operand size override)
+    cvtpd2dq:   F2 0F E6 ModRM   (F2 = REPNE prefix, used as SSE prefix)
+                │  │  │  └── ModR/M byte specifying registers
+                │  │  └── Opcode byte
+                │  └── Two-byte opcode escape
+                └── Mandatory prefix (determines truncate vs round)
 
 The ModR/M byte encodes operands:
 
@@ -89,15 +98,19 @@ import sys
 import struct
 
 # ==============================================================================
-# 3. FINDING cvttpd2dq INSTRUCTIONS
+# 3. FINDING BUGGY INSTRUCTIONS
 # ==============================================================================
 
-def find_cvttpd2dq(data: bytes) -> list:
+def find_cvt_instructions(data: bytes) -> list:
     """
-    Scan binary for cvttpd2dq instructions with register-register encoding.
+    Scan binary for cvttpd2dq and cvtpd2dq instructions with register-register
+    encoding.
 
-    We search for the byte sequence: 66 0F E6 followed by a ModR/M byte
-    where mod=11 (indicating register-to-register form).
+    We search for byte sequences:
+        66 0F E6 ModRM  (cvttpd2dq - truncate)
+        F2 0F E6 ModRM  (cvtpd2dq - round)
+
+    followed by a ModR/M byte where mod=11 (register-to-register form).
 
     The memory-operand forms (mod != 11) are more complex to patch and less
     common in the hot paths that cause problems, so we skip them.
@@ -110,15 +123,17 @@ def find_cvttpd2dq(data: bytes) -> list:
         - next_len: length of following instruction
         - next_relocatable: whether following instruction can be moved
         - next_bytes: raw bytes of following instruction
+        - opcode: 'cvttpd2dq' or 'cvtpd2dq'
     """
     results = []
     i = 0
 
-    # The cvttpd2dq opcode with mandatory 66 prefix
-    CVTTPD2DQ_OPCODE = b'\x66\x0f\xe6'
+    # Both buggy opcodes share 0F E6, differ in prefix
+    CVTTPD2DQ_OPCODE = b'\x66\x0f\xe6'  # Truncate
+    CVTPD2DQ_OPCODE = b'\xf2\x0f\xe6'   # Round
 
     while i < len(data) - 3:
-        if data[i:i+3] == CVTTPD2DQ_OPCODE:
+        if data[i:i+3] == CVTTPD2DQ_OPCODE or data[i:i+3] == CVTPD2DQ_OPCODE:
             modrm = data[i+3]
 
             # Extract ModR/M fields
@@ -128,6 +143,9 @@ def find_cvttpd2dq(data: bytes) -> list:
 
             # Only handle register-register form (mod == 3)
             if mod == 3:
+                # Determine which opcode this is
+                opcode = 'cvttpd2dq' if data[i] == 0x66 else 'cvtpd2dq'
+
                 # Analyze the instruction that follows
                 next_len, relocatable = decode_next_instruction(data, i + 4)
 
@@ -138,7 +156,8 @@ def find_cvttpd2dq(data: bytes) -> list:
                     'same_reg': src == dst,
                     'next_len': next_len,
                     'next_relocatable': relocatable,
-                    'next_bytes': data[i+4:i+4+next_len] if next_len > 0 else b''
+                    'next_bytes': data[i+4:i+4+next_len] if next_len > 0 else b'',
+                    'opcode': opcode
                 })
         i += 1
 
@@ -311,12 +330,13 @@ def find_code_caves(data: bytes, min_size: int = 64) -> list:
 # 5. THE TRAMPOLINE TECHNIQUE
 # ==============================================================================
 
-def build_trampoline(src_xmm: int, dst_xmm: int, next_bytes: bytes) -> bytes:
+def build_trampoline(src_xmm: int, dst_xmm: int, next_bytes: bytes,
+                     opcode: str = 'cvttpd2dq') -> bytes:
     """
     Build a "trampoline" - a small code snippet that:
 
     1. Saves the source XMM register (which Rosetta will corrupt)
-    2. Executes the original cvttpd2dq instruction
+    2. Executes the original cvttpd2dq or cvtpd2dq instruction
     3. Restores the source XMM register
     4. Executes the displaced "next" instruction
     5. Jumps back to the original code
@@ -325,7 +345,7 @@ def build_trampoline(src_xmm: int, dst_xmm: int, next_bytes: bytes) -> bytes:
 
         Original code:          Patched code:
         ┌─────────────────┐     ┌─────────────────┐
-        │ cvttpd2dq       │ ──► │ jmp trampoline  │
+        │ cvt[t]pd2dq     │ ──► │ jmp trampoline  │
         │ next_instr      │     │ nop nop...      │
         │ ...             │     │ ...             │
         └─────────────────┘     └─────────────────┘
@@ -334,7 +354,7 @@ def build_trampoline(src_xmm: int, dst_xmm: int, next_bytes: bytes) -> bytes:
                                 ┌─────────────────────────┐
                                 │ sub rsp, 16             │ ◄── allocate stack
                                 │ movdqu [rsp], xmmN      │ ◄── save source
-                                │ cvttpd2dq xmmN, xmmM    │ ◄── original insn
+                                │ cvt[t]pd2dq xmmN, xmmM  │ ◄── original insn
                                 │ movdqu xmmN, [rsp]      │ ◄── restore source
                                 │ add rsp, 16             │ ◄── deallocate
                                 │ <next_instr>            │ ◄── displaced insn
@@ -342,8 +362,8 @@ def build_trampoline(src_xmm: int, dst_xmm: int, next_bytes: bytes) -> bytes:
                                 └─────────────────────────┘
 
     Why we also move the "next" instruction:
-        cvttpd2dq is 4 bytes, but JMP rel32 needs 5 bytes. We "borrow" space
-        from the following instruction by relocating it into the trampoline.
+        Both instructions are 4 bytes, but JMP rel32 needs 5 bytes. We "borrow"
+        space from the following instruction by relocating it into the trampoline.
 
     References:
         - "Static Binary Rewriting without Supplemental Information"
@@ -371,10 +391,11 @@ def build_trampoline(src_xmm: int, dst_xmm: int, next_bytes: bytes) -> bytes:
 
     # ─── Execute the original instruction (will corrupt source) ───
 
-    # cvttpd2dq xmmSRC, xmmDST
-    # Encoding: 66 0F E6 ModRM
+    # cvttpd2dq xmmSRC, xmmDST (66 0F E6) or cvtpd2dq (F2 0F E6)
+    # Encoding: prefix + 0F E6 ModRM
     modrm = 0xC0 | (dst_xmm << 3) | src_xmm
-    code += bytes([0x66, 0x0f, 0xe6, modrm])
+    prefix = 0x66 if opcode == 'cvttpd2dq' else 0xF2
+    code += bytes([prefix, 0x0f, 0xe6, modrm])
 
     # ─── Epilogue: Restore source register ───
 
@@ -451,7 +472,8 @@ def patch_binary(data: bytes, instances: list, caves: list) -> tuple:
 
         # Build trampoline
         trampoline = bytearray(build_trampoline(
-            inst['src'], inst['dst'], inst['next_bytes']))
+            inst['src'], inst['dst'], inst['next_bytes'],
+            inst.get('opcode', 'cvttpd2dq')))
 
         # Calculate return jump offset
         # JMP is at end of trampoline, offset is relative to after JMP
@@ -473,7 +495,7 @@ def patch_binary(data: bytes, instances: list, caves: list) -> tuple:
             patched[offset + i] = 0x90
 
         count += 1
-        print(f"  Patched 0x{offset:x}: xmm{inst['src']} -> xmm{inst['dst']}")
+        print(f"  Patched 0x{offset:x}: {inst.get('opcode', 'cvttpd2dq')} xmm{inst['src']} -> xmm{inst['dst']}")
 
     return bytes(patched), count
 
@@ -498,14 +520,18 @@ def main():
     with open(sys.argv[1], 'rb') as f:
         data = f.read()
 
-    # Step 1: Find all cvttpd2dq instructions
-    instances = find_cvttpd2dq(data)
+    # Step 1: Find all cvttpd2dq and cvtpd2dq instructions
+    instances = find_cvt_instructions(data)
     problematic = [i for i in instances if not i['same_reg']]
 
     # Step 2: Find code caves
     caves = find_code_caves(data)
 
-    print(f"Found {len(instances)} cvttpd2dq instructions")
+    cvttpd2dq_count = len([i for i in instances if i.get('opcode') == 'cvttpd2dq'])
+    cvtpd2dq_count = len([i for i in instances if i.get('opcode') == 'cvtpd2dq'])
+    print(f"Found {len(instances)} conversion instructions:")
+    print(f"  {cvttpd2dq_count} cvttpd2dq (truncate)")
+    print(f"  {cvtpd2dq_count} cvtpd2dq (round)")
     print(f"  {len(problematic)} need patching (different src/dst)")
     print(f"Found {len(caves)} code caves")
 
