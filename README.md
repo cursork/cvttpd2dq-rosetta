@@ -8,7 +8,15 @@ versions.
 
 ## TL;DR
 
-Run the test suite to see the bug and fix in action:
+Simple walkthrough of the issue (will run node docker containers):
+
+```bash
+./walkthrough
+```
+
+![Walkthrough demo](walkthrough.gif)
+
+Sanity tests:
 
 ```bash
 ./test-all.sh --extract    # Extracts Node.js + Bun from Docker, tests both
@@ -21,19 +29,17 @@ cp /path/to/dyalog*.deb .
 ./test-all.sh --extract    # Tests all three: Node.js, Bun, Dyalog APL
 ```
 
-![Walkthrough demo](walkthrough.gif)
-
 For the literate/educational version, read `patch_explained.py`.
 
 ## The Problem
 
+Simplest example:
+
 ```bash
 $ docker run --platform linux/amd64 --rm node:25-slim node -e "console.log(0.25)"
 0
-
 $ docker run --platform linux/amd64 --rm node:25-slim node -e "console.log(1/4)"
 0
-
 $ docker run --platform linux/amd64 --rm node:25-slim node -e "console.log(Math.PI)"
 3
 ```
@@ -133,26 +139,7 @@ python3 patch.py /path/to/binary /path/to/binary-patched
 chmod +x /path/to/binary-patched
 ```
 
-## Verify the Fix
-
-```bash
-# Build with patch
-docker build -t rosetta-bug .
-docker run --platform linux/amd64 --rm rosetta-bug
-
-# Output:
-# === Test C reproducer ===
-# Before: 0.25
-# After:  0
-# BUG: xmm0 was corrupted!
-#
-# === Unpatched Node 25 ===
-# 0.25 = 0 | 1.5 = 1
-#
-# === Patched Node 25 ===
-# 0.25 = 0.25 | 1.5 = 1.5
-```
-
 ## Related
 
-- https://github.com/oven-sh/bun/issues/19677
+This was the only mention I could find easily of cvttpd2dq() being the culprit:
+https://github.com/oven-sh/bun/issues/19677
